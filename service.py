@@ -1,6 +1,7 @@
 """
 services.py
-Módulo isolado para operações de I/O de arquivos de rede e compactação.
+Camada de regras de negócio: varredura de rede, download em streaming,
+extração estruturada e compactação de release.
 """
 
 from __future__ import annotations
@@ -11,17 +12,15 @@ import shutil
 import subprocess
 from typing import Callable
 import zipfile
-import datetime
-
-from coverage import data
 
 
 class UpdaterService:
-    """Concentra a lógica de busca e transferência de atualizadores."""
+    """Concentra as regras de arquivos, rede e manipulação de pacotes de atualização."""
+
     def __init__(self, config_file: str = "config.ini") -> None:
         self.config = configparser.ConfigParser()
         if not os.path.exists(config_file):
-            self.criar_config_padrao(config_file)
+            self._criar_config_padrao(config_file)
         self.config.read(config_file, encoding="utf-8")
 
         destino_custom = self.config.get("CONFIGURACOES", "destino_base", fallback="").strip()
@@ -29,12 +28,13 @@ class UpdaterService:
             self.destino_base = Path(destino_custom)
         else:
             self.destino_base = Path.home() / "Documents" / "Atualiza_Nuvem"
+
         self.winrar_path = Path(
             self.config.get("CONFIGURACOES", "winrar_path", fallback=r"C:\Program Files\WinRAR\WinRAR.exe")
         )
 
     def _criar_config_padrao(self, config_file: str) -> None:
-        """Gera um arquivo de configuração caso não exista."""
+        """Gera o arquivo de configurações caso não exista."""
         self.config["CONFIGURACOES"] = {
             "destino_base": "",
             "winrar_path": r"C:\Program Files\WinRAR\WinRAR.exe"
@@ -49,34 +49,33 @@ class UpdaterService:
             self.config.write(f)
 
     def listar_versoes(self, sistema: str) -> list[dict[str, str]]:
-        """
-        Escaneia as pastas de rede do sistema escolhido e retorna uma lista
-        de versões disponíveis com data de modificação, da mais nova para a mais antiga.
-        """
-
+        """Varre os diretórios da rede e lista as versões disponíveis em ordem decrescente."""
         resultado: list[dict[str, str]] = []
 
         if sistema == "AC":
             caminho_base = Path(self.config.get("REDE", "origem_ac"))
             if caminho_base.exists():
                 for pasta in caminho_base.iterdir():
-                    mtime = pasta.stat().st_mtime
-                    resultado.append({
-                        "versao" : pasta.name,
-                        "data" : self._formatar_data(mtime),
-                        "timestamp" : str(mtime)
-                    })
+                    if pasta.is_dir():
+                        mtime = pasta.stat().st_mtime
+                        resultado.append({
+                            "versao": pasta.name,
+                            "data": self._formatar_data(mtime),
+                            "timestamp": str(mtime)
+                        })
 
         elif sistema == "Patrio":
             caminho_base = Path(self.config.get("REDE", "origem_patrio"))
             if caminho_base.exists():
                 for pasta in caminho_base.iterdir():
-                    mtime = pasta.stat().st_mtime
-                    resultado.append({
-                        "versao" : pasta.name,
-                        "data" : self._formatar_data(mtime),
-                        "timestamp" : str(mtime)
-                    })
+                    if pasta.is_dir():
+                        mtime = pasta.stat().st_mtime
+                        resultado.append({
+                            "versao": pasta.name,
+                            "data": self._formatar_data(mtime),
+                            "timestamp": str(mtime)
+                        })
+
         elif sistema == "AG":
             dir_nuvem = Path(self.config.get("REDE", "origem_ag_nuvem"))
             dir_old = Path(self.config.get("REDE", "origem_ag_old"))
@@ -84,7 +83,7 @@ class UpdaterService:
                 for pasta in dir_nuvem.iterdir():
                     if pasta.is_dir():
                         nome_versao = pasta.name
-                        exe_old = dir_nuvem / f"FortesAGAtualizador_{nome_versao}.exe"
+                        exe_old = dir_old / f"FortesAGAtualizador_{nome_versao}.exe"
                         if exe_old.exists():
                             mtime = pasta.stat().st_mtime
                             resultado.append({
@@ -97,16 +96,16 @@ class UpdaterService:
         return resultado
 
     def copiar_arquivo_com_progresso(
-            self,
-            origem: Path,
-            destino: Path,
-            callback_progresso: Callable[[float], None],
-            callback_log: Callable[[str], None]
+        self,
+        origem: Path,
+        destino: Path,
+        callback_progresso: Callable[[float], None],
+        callback_log: Callable[[str], None]
     ) -> None:
-        """Copia um arquivo em blocos (chunks), atualizando a barra de progresso."""
+        """Copia arquivo em streaming com buffer de 64KB atualizando a UI."""
         tamanho_total = origem.stat().st_size
         tamanho_mb = tamanho_total / (1024 * 1024)
-        callback_log(f">> Baixando aquivo: {origem.name} ({tamanho_mb:.2f}MB, aguarde...)")
+        callback_log(f">> Baixando: {origem.name} ({tamanho_mb:.2f} MB)...")
 
         tamanho_bloco = 1024 * 64
         bytes_copiados = 0
@@ -130,12 +129,18 @@ class UpdaterService:
         callback_progresso: Callable[[float], None],
         callback_log: Callable[[str], None]
     ) -> Path:
-        """Executa a rotina completa de download, descompactação e compactação."""
-        pasta_destino = self.destino_base / sistema / versao
-        pasta_destino.mkdir(parents=True, exist_ok=True)
-        arquivos_baixados: list[Path] = []
+        """Executa a rotina garantindo integridade dos dados baixados."""
+        pasta_versao = self.destino_base / sistema / versao
+        pasta_versao.mkdir(parents=True, exist_ok=True)
 
-        # 1. Identificação e Download dos Arquivos conforme as regras de negócio
+        pasta_atualiza = pasta_versao / f"Atualiza{sistema}"
+
+        # ---------------------------------------------------------
+        # ETAPA 1: DOWNLOAD DOS EXECUTÁVEIS ORIGINAIS
+        # ---------------------------------------------------------
+        arquivos_instaladores: list[Path] = []
+        arquivos_adicionais: list[Path] = []
+
         if sistema == "AC":
             raiz_ac = Path(self.config.get("REDE", "origem_ac")) / versao
             atualizador_nuvem = raiz_ac / "Nuvem" / "FortesACAtualizadorNuvem.exe"
@@ -146,117 +151,171 @@ class UpdaterService:
                 origem_exe = atualizador_nuvem
             elif ac_nuvem.exists():
                 origem_exe = ac_nuvem
-                callback_log(">> FortesACAtualizadorNuvem ausente. Usando Nuvem\\AC.exe")
+                callback_log(">> AtualizadorNuvem ausente. Usando AC.exe da Nuvem.")
             elif ac_raiz.exists():
                 origem_exe = ac_raiz
                 callback_log(">> Usando AC.exe da raiz.")
             else:
                 raise FileNotFoundError(f"Nenhum executável válido encontrado para AC {versao}")
 
-            dest_exe = pasta_destino / origem_exe.name
+            dest_exe = pasta_versao / origem_exe.name
             self.copiar_arquivo_com_progresso(origem_exe, dest_exe, callback_progresso, callback_log)
-            arquivos_baixados.append(dest_exe)
+            arquivos_instaladores.append(dest_exe)
 
         elif sistema == "Patrio":
             nome_arquivo = f"FortesPatrioAtualizadorNuvem_{versao}.exe"
             origem = Path(self.config.get("REDE", "origem_patrio")) / versao / "Nuvem" / nome_arquivo
             if not origem.exists():
                 raise FileNotFoundError(f"Arquivo {nome_arquivo} não encontrado na rede.")
-            dest = pasta_destino / nome_arquivo
+            dest = pasta_versao / nome_arquivo
             self.copiar_arquivo_com_progresso(origem, dest, callback_progresso, callback_log)
-            arquivos_baixados.append(dest)
+            arquivos_instaladores.append(dest)
 
         elif sistema == "AG":
-            origem_ag = Path(self.config.get("REDE", "origem_ag_nuvem")) / versao / "AG.exe"
-            if origem_ag.exists():
-                dest_ag = pasta_destino / "AG.exe"
-                self.copiar_arquivo_com_progresso(origem_ag, dest_ag, callback_progresso, callback_log)
-                arquivos_baixados.append(dest_ag)
-
             nome_old = f"FortesAGAtualizador_{versao}.exe"
             origem_old = Path(self.config.get("REDE", "origem_ag_old")) / nome_old
             if origem_old.exists():
-                dest_old = pasta_destino / nome_old
+                dest_old = pasta_versao / nome_old
                 self.copiar_arquivo_com_progresso(origem_old, dest_old, callback_progresso, callback_log)
-                arquivos_baixados.append(dest_old)
+                arquivos_instaladores.append(dest_old)
+            else:
+                callback_log(f"   [AVISO] Arquivo {nome_old} não foi localizado em 'origem_ag_old'.")
 
-        # 2. Descompactação via WinRAR
-        if deseja_descompactar:
-            callback_log(">> Extração ativada. Invocando WinRAR...")
-            for arq in arquivos_baixados:
-                self._descompactar_winrar(arq, pasta_destino, callback_log)
+            origem_ag = Path(self.config.get("REDE", "origem_ag_nuvem")) / versao / "AG.exe"
+            if origem_ag.exists():
+                dest_ag = pasta_versao / "AG.exe"
+                self.copiar_arquivo_com_progresso(origem_ag, dest_ag, callback_progresso, callback_log)
+                arquivos_adicionais.append(dest_ag)
+            else:
+                callback_log(f"   [AVISO] AG.exe não localizado em 'origem_ag_nuvem\\{versao}'.")
 
-        # 3. Compactação em .rar (ou .zip caso WinRAR não exista)
+        # TRAVA DE SEGURANÇA: Se nada foi baixado, interrompe imediatamente!
+        if not arquivos_instaladores and not arquivos_adicionais:
+            raise FileNotFoundError(
+                f"Nenhum arquivo foi transferido da rede para {sistema} versão '{versao}'. "
+                "Verifique se o caminho de rede está acessível."
+            )
+
+        # ---------------------------------------------------------
+        # ETAPA 2: EXTRAÇÃO DO EXECUTÁVEL NA PASTA Atualiza{Sistema}
+        # ---------------------------------------------------------
+        precisa_extrair = deseja_descompactar or deseja_compactar
+
+        if precisa_extrair:
+            pasta_atualiza.mkdir(exist_ok=True)
+            callback_log(f">> Extraindo instalador para a pasta \\{pasta_atualiza.name}...")
+
+            for instalador in arquivos_instaladores:
+                self._descompactar_com_winrar(instalador, pasta_atualiza, callback_log)
+
+            # Move binários complementares (como o AG.exe) para dentro da pasta extraída
+            for extra in arquivos_adicionais:
+                destino_extra = pasta_atualiza / extra.name
+                shutil.move(str(extra), str(destino_extra))
+
+        # ---------------------------------------------------------
+        # ETAPA 3: COMPACTAÇÃO DA PASTA Atualiza{Sistema}
+        # ---------------------------------------------------------
         if deseja_compactar:
-            callback_log(">> Compactação ativada. Gerando pacote...")
-            self._compactar(sistema, arquivos_baixados, pasta_destino, callback_log)
+            callback_log(f">> Compactando pasta \\{pasta_atualiza.name} em formato .rar...")
+            self._compactar_pasta(sistema, pasta_atualiza, pasta_versao, callback_log)
 
-            # Limpeza dos binários originais soltos, exatamente como no código original
-            callback_log(">> Limpeza: removendo executáveis originais soltos...")
-            for arq in arquivos_baixados:
+        # ---------------------------------------------------------
+        # ETAPA 4: LIMPEZA INTELIGENTE
+        # ---------------------------------------------------------
+        if precisa_extrair:
+            callback_log(">> Realizando limpeza dos arquivos temporários...")
+            for instalador in arquivos_instaladores:
                 try:
-                    arq.unlink(missing_ok=True)
-                except Exception as ex:
-                    callback_log(f"   [AVISO] Falha ao deletar temporário {arq.name}: {ex}")
+                    instalador.unlink(missing_ok=True)
+                    callback_log(f"   -> Removido instalador baixado: {instalador.name}")
+                except Exception as e:
+                    callback_log(f"   [AVISO] Falha ao remover {instalador.name}: {e}")
 
-        callback_log(">> Processo 100% finalizado!")
-        return pasta_destino
+        # Se não marcou descompactar, remove a pasta solta mantendo apenas o .rar
+        if deseja_compactar and not deseja_descompactar:
+            try:
+                shutil.rmtree(pasta_atualiza, ignore_errors=True)
+                callback_log(f"   -> Pasta temporária \\{pasta_atualiza.name} removida.")
+            except Exception as e:
+                callback_log(f"   [AVISO] Falha ao limpar pasta: {e}")
 
-    def _descompactar_winrar(self, arquivo: Path, pasta_destino: Path, callback_log: Callable[[str], None]) -> None:
-        """Executa a descompactação via WinRAR CLI."""
+        callback_log(">> Processo 100% finalizado com sucesso!")
+        return pasta_versao
+
+    def _descompactar_com_winrar(self, arquivo_exe: Path, pasta_saida: Path, callback_log: Callable[[str], None]) -> None:
+        """Extrai o conteúdo do executável diretamente na pasta de destino."""
         if not self.winrar_path.exists():
-            return callback_log(f" [ERRO] - Winrar não localizado. Extraçõ ignorada.")
-
-        pasta_extracao = pasta_destino / arquivo.stem
-        pasta_extracao.mkdir(exist_ok=True)
+            callback_log("   [ERRO] WinRAR não encontrado em C:\\Program Files\\WinRAR\\WinRAR.exe.")
+            return
 
         comando = [
             str(self.winrar_path),
-            "x",  # Extrair com caminhos completos
-            "-ibck",  # Executar em segundo plano
-            "-y",  # Sobrescrever automaticamente
-            str(arquivo),
-            str(pasta_extracao) + "\\"
+            "x",
+            "-ibck",
+            "-y",
+            str(arquivo_exe),
+            str(pasta_saida) + "\\"
         ]
-        try:
-            resultado = subprocess.run(comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            if resultado.returncode == 0:
-                return callback_log(f" -> Extraído com sucesso em: \\{pasta_extracao.name}")
-            else:
-                return callback_log(f" [AVISO] - Winrar retornou código de aviso/erro: {resultado.returncode}")
-        except Exception as e:
-            return callback_log(f" [ERRO] - Falha ao executar WinRAR: {e}")
 
-    def _compactar(self,
-                   sistema: str,
-                   arquivos: list[Path],
-                   pasta_destino: Path,
-                   callback_log: Callable[[str], None]) -> None:
-        """Compacta em .rar caso o WinRAR esteja presente; fallback para .zip caso não esteja."""
+        try:
+            res = subprocess.run(comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if res.returncode == 0:
+                callback_log(f"   -> Conteúdo extraído com sucesso dentro de \\{pasta_saida.name}")
+            else:
+                callback_log(f"   [AVISO] WinRAR encerrou com código {res.returncode}.")
+        except Exception as e:
+            callback_log(f"   [ERRO] Falha ao invocar WinRAR: {e}")
+
+    def _compactar_pasta(
+        self,
+        sistema: str,
+        pasta_alvo: Path,
+        pasta_destino: Path,
+        callback_log: Callable[[str], None]
+    ) -> None:
+        """Compacta a pasta Atualiza{Sistema} gerando Atualiza{Sistema}.rar."""
+        nome_pacote_rar = f"Atualiza{sistema}.rar"
+        rar_saida = pasta_destino / nome_pacote_rar
+
         if self.winrar_path.exists():
-            rar_destino = pasta_destino / f"Atualiza{sistema}.rar"
-            comando = [str(self.winrar_path),
-                       "a", # Adiciona ao arquivo
-                       "-ep1", # Exclui o diretório base do nome gravado
-                       "-y", # Sobrescreve
-                       str(rar_destino)
-        ] + [str(a) for a in arquivos]
+            comando = [
+                str(self.winrar_path),
+                "a",
+                "-r",
+                "-ibck",
+                "-y",
+                nome_pacote_rar,
+                pasta_alvo.name
+            ]
 
             try:
-                subprocess.run(comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                return callback_log(f"  ->Arquivo RAR gerado: {rar_destino.name}")
+                res = subprocess.run(
+                    comando,
+                    cwd=str(pasta_destino),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False
+                )
+                if res.returncode == 0:
+                    callback_log(f"   -> Pacote gerado com sucesso: {nome_pacote_rar}")
+                    return
+                callback_log("   [AVISO] WinRAR retornou erro ao compactar. Tentando ZIP...")
             except Exception as e:
-                callback_log(f" [ERRO] - Falha ao criar RAR: {e}. Alternando para ZIP")
+                callback_log(f"   [ERRO] Falha ao acionar compactação WinRAR: {e}")
 
-        # Fallback nativo: .zip
-        zip_detino = pasta_destino / f"Atualiza{sistema}.zip"
-        with zipfile.ZipFile(zip_detino, 'w', zipfile.ZipFile) as zipf:
-            for arq in arquivos:
-                zipf.write(arq, arcname=arq.name)
-        callback_log(f" -> Arquivo ZIP gerado: {zip_detino.name}")
+        # Fallback de segurança em ZIP caso o WinRAR falhe
+        zip_saida = pasta_destino / f"Atualiza{sistema}.zip"
+        shutil.make_archive(
+            base_name=str(pasta_destino / f"Atualiza{sistema}"),
+            format="zip",
+            root_dir=str(pasta_destino),
+            base_dir=pasta_alvo.name
+        )
+        callback_log(f"   -> Pacote alternativo gerado: {zip_saida.name}")
 
     @staticmethod
     def _formatar_data(timestamp: float) -> str:
-        """Converte timestamp POSIX para formato legível no Brasil."""
-        dt = datetime.datetime.fromtimestamp(timestamp)
-        return  dt.strftime("%d/%m/%Y %H:%M:%S")
+        """Converte timestamp POSIX para formato legível de data e hora."""
+        import datetime
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%d/%m/%Y %H:%M:%S")
